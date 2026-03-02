@@ -2,6 +2,7 @@ package com.tonic.services.llmapi;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import com.tonic.services.llmapi.actions.ActionTracker;
 import com.tonic.services.llmapi.handlers.ActionHandlers;
 import com.tonic.services.llmapi.handlers.DataHandlers;
 import com.tonic.services.llmapi.handlers.WalkerHandlers;
@@ -34,11 +35,13 @@ public class LLMApiServer {
     private final DataHandlers dataHandlers;
     private final ActionHandlers actionHandlers;
     private final WalkerHandlers walkerHandlers;
+    private final ActionTracker actionTracker;
 
     private LLMApiServer() {
         dataHandlers = new DataHandlers();
         actionHandlers = new ActionHandlers();
         walkerHandlers = new WalkerHandlers();
+        actionTracker = ActionTracker.getInstance();
     }
 
     public static LLMApiServer getInstance() {
@@ -105,6 +108,7 @@ public class LLMApiServer {
 
         // Dialogue endpoints
         server.createContext("/dialogue", this::handleDialogue);
+        server.createContext("/actions", this::handleActions);
 
         server.start();
         running = true;
@@ -117,6 +121,7 @@ public class LLMApiServer {
         }
         server.stop(0);
         running = false;
+        actionTracker.shutdown();
         System.out.println("[LLMApiServer] Stopped");
     }
 
@@ -156,13 +161,25 @@ public class LLMApiServer {
             int index = extractPathInt(path, "/players/", "/interact");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.interactPlayer(index, body));
+                submitTrackedAction(
+                        exchange,
+                        "PLAYER_INTERACT",
+                        body,
+                        "{\"playerIndex\":" + index + "}",
+                        () -> actionHandlers.interactPlayer(index, body)
+                );
             }
         } else if (path.matches("/players/\\d+/use-item")) {
             int index = extractPathInt(path, "/players/", "/use-item");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.useItemOnPlayer(index, body));
+                submitTrackedAction(
+                        exchange,
+                        "PLAYER_USE_ITEM",
+                        body,
+                        "{\"playerIndex\":" + index + "}",
+                        () -> actionHandlers.useItemOnPlayer(index, body)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown players endpoint"));
@@ -185,13 +202,25 @@ public class LLMApiServer {
             int index = extractPathInt(path, "/npcs/", "/interact");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.interactNpc(index, body));
+                submitTrackedAction(
+                        exchange,
+                        "NPC_INTERACT",
+                        body,
+                        "{\"npcIndex\":" + index + "}",
+                        () -> actionHandlers.interactNpc(index, body)
+                );
             }
         } else if (path.matches("/npcs/\\d+/use-item")) {
             int index = extractPathInt(path, "/npcs/", "/use-item");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.useItemOnNpc(index, body));
+                submitTrackedAction(
+                        exchange,
+                        "NPC_USE_ITEM",
+                        body,
+                        "{\"npcIndex\":" + index + "}",
+                        () -> actionHandlers.useItemOnNpc(index, body)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown npcs endpoint"));
@@ -218,13 +247,25 @@ public class LLMApiServer {
             int id = extractPathInt(path, "/objects/", "/interact");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.interactObject(id, body));
+                submitTrackedAction(
+                        exchange,
+                        "OBJECT_INTERACT",
+                        body,
+                        "{\"objectId\":" + id + "}",
+                        () -> actionHandlers.interactObject(id, body)
+                );
             }
         } else if (path.matches("/objects/\\d+/use-item")) {
             int id = extractPathInt(path, "/objects/", "/use-item");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.useItemOnObject(id, body));
+                submitTrackedAction(
+                        exchange,
+                        "OBJECT_USE_ITEM",
+                        body,
+                        "{\"objectId\":" + id + "}",
+                        () -> actionHandlers.useItemOnObject(id, body)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown objects endpoint"));
@@ -251,13 +292,25 @@ public class LLMApiServer {
             int id = extractPathInt(path, "/ground-items/", "/interact");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.interactGroundItem(id, body));
+                submitTrackedAction(
+                        exchange,
+                        "GROUND_ITEM_INTERACT",
+                        body,
+                        "{\"groundItemId\":" + id + "}",
+                        () -> actionHandlers.interactGroundItem(id, body)
+                );
             }
         } else if (path.matches("/ground-items/\\d+/use-item")) {
             int id = extractPathInt(path, "/ground-items/", "/use-item");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.useItemOnGroundItem(id, body));
+                submitTrackedAction(
+                        exchange,
+                        "GROUND_ITEM_USE_ITEM",
+                        body,
+                        "{\"groundItemId\":" + id + "}",
+                        () -> actionHandlers.useItemOnGroundItem(id, body)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown ground-items endpoint"));
@@ -280,18 +333,36 @@ public class LLMApiServer {
             int slot = extractPathInt(path, "/inventory/", "/interact");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.interactInventory(slot, body));
+                submitTrackedAction(
+                        exchange,
+                        "INVENTORY_INTERACT",
+                        body,
+                        "{\"slot\":" + slot + "}",
+                        () -> actionHandlers.interactInventory(slot, body)
+                );
             }
         } else if (path.matches("/inventory/\\d+/use-on-item")) {
             int slot = extractPathInt(path, "/inventory/", "/use-on-item");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.useOnInventoryItem(slot, body));
+                submitTrackedAction(
+                        exchange,
+                        "INVENTORY_USE_ON_ITEM",
+                        body,
+                        "{\"slot\":" + slot + "}",
+                        () -> actionHandlers.useOnInventoryItem(slot, body)
+                );
             }
         } else if (path.matches("/inventory/\\d+/drop")) {
             int slot = extractPathInt(path, "/inventory/", "/drop");
             if (checkPost(exchange)) {
-                sendJson(exchange, 200, actionHandlers.dropInventoryItem(slot));
+                submitTrackedAction(
+                        exchange,
+                        "INVENTORY_DROP",
+                        "{}",
+                        "{\"slot\":" + slot + "}",
+                        () -> actionHandlers.dropInventoryItem(slot)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown inventory endpoint"));
@@ -314,12 +385,24 @@ public class LLMApiServer {
             int slot = extractPathInt(path, "/equipment/", "/interact");
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.interactEquipment(slot, body));
+                submitTrackedAction(
+                        exchange,
+                        "EQUIPMENT_INTERACT",
+                        body,
+                        "{\"slot\":" + slot + "}",
+                        () -> actionHandlers.interactEquipment(slot, body)
+                );
             }
         } else if (path.matches("/equipment/\\d+/unequip")) {
             int slot = extractPathInt(path, "/equipment/", "/unequip");
             if (checkPost(exchange)) {
-                sendJson(exchange, 200, actionHandlers.unequipItem(slot));
+                submitTrackedAction(
+                        exchange,
+                        "EQUIPMENT_UNEQUIP",
+                        "{}",
+                        "{\"slot\":" + slot + "}",
+                        () -> actionHandlers.unequipItem(slot)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown equipment endpoint"));
@@ -392,12 +475,24 @@ public class LLMApiServer {
         if (path.equals("/walk")) {
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, walkerHandlers.walkTo(body));
+                submitTrackedAction(
+                        exchange,
+                        "WALK_LOCAL",
+                        body,
+                        "{}",
+                        () -> walkerHandlers.walkTo(body)
+                );
             }
         } else if (path.equals("/walk/relative")) {
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, walkerHandlers.walkRelative(body));
+                submitTrackedAction(
+                        exchange,
+                        "WALK_RELATIVE",
+                        body,
+                        "{}",
+                        () -> walkerHandlers.walkRelative(body)
+                );
             }
         } else if (path.equals("/walk/destination")) {
             if (checkGet(exchange)) {
@@ -418,7 +513,13 @@ public class LLMApiServer {
         if (path.equals("/walker/walk-to")) {
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, walkerHandlers.walkerWalkTo(body));
+                submitTrackedAction(
+                        exchange,
+                        "WALKER_WALK_TO",
+                        body,
+                        "{}",
+                        () -> walkerHandlers.walkerWalkTo(body)
+                );
             }
         } else if (path.equals("/walker/status")) {
             if (checkGet(exchange)) {
@@ -426,11 +527,23 @@ public class LLMApiServer {
             }
         } else if (path.equals("/walker/cancel")) {
             if (checkPost(exchange)) {
-                sendJson(exchange, 200, walkerHandlers.cancelWalker());
+                submitTrackedAction(
+                        exchange,
+                        "WALKER_CANCEL",
+                        "{}",
+                        "{}",
+                        walkerHandlers::cancelWalker
+                );
             }
         } else if (path.equals("/walker/step")) {
             if (checkPost(exchange)) {
-                sendJson(exchange, 200, walkerHandlers.stepWalker());
+                submitTrackedAction(
+                        exchange,
+                        "WALKER_STEP",
+                        "{}",
+                        "{}",
+                        walkerHandlers::stepWalker
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown walker endpoint"));
@@ -446,21 +559,81 @@ public class LLMApiServer {
             }
         } else if (path.equals("/dialogue/continue")) {
             if (checkPost(exchange)) {
-                sendJson(exchange, 200, actionHandlers.continueDialogue());
+                submitTrackedAction(
+                        exchange,
+                        "DIALOGUE_CONTINUE",
+                        "{}",
+                        "{}",
+                        actionHandlers::continueDialogue
+                );
             }
         } else if (path.equals("/dialogue/select")) {
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.selectDialogueOption(body));
+                submitTrackedAction(
+                        exchange,
+                        "DIALOGUE_SELECT",
+                        body,
+                        "{}",
+                        () -> actionHandlers.selectDialogueOption(body)
+                );
             }
         } else if (path.equals("/dialogue/enter-number")) {
             if (checkPost(exchange)) {
                 String body = readBody(exchange);
-                sendJson(exchange, 200, actionHandlers.enterDialogueNumber(body));
+                submitTrackedAction(
+                        exchange,
+                        "DIALOGUE_ENTER_NUMBER",
+                        body,
+                        "{}",
+                        () -> actionHandlers.enterDialogueNumber(body)
+                );
             }
         } else {
             sendJson(exchange, 404, JsonBuilder.error(404, "Unknown dialogue endpoint"));
         }
+    }
+
+    private void handleActions(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        Map<String, String> params = parseQuery(exchange);
+
+        if (path.equals("/actions/stream")) {
+            if (checkGet(exchange)) {
+                actionTracker.openStream(exchange);
+            }
+            return;
+        }
+
+        if (path.equals("/actions")) {
+            if (checkGet(exchange)) {
+                int limit = parseIntParam(params, "limit", 20);
+                String status = params.get("status");
+                sendJson(exchange, 200, actionTracker.listActions(limit, status));
+            }
+            return;
+        }
+
+        if (path.matches("/actions/[^/]+/cancel")) {
+            String actionId = extractPathString(path, "/actions/", "/cancel");
+            if (checkPost(exchange)) {
+                ActionTracker.SubmitResult cancelResult = actionTracker.cancel(actionId);
+                sendJson(exchange, cancelResult.getStatusCode(), cancelResult.getResponseBody());
+            }
+            return;
+        }
+
+        if (path.matches("/actions/[^/]+")) {
+            String actionId = extractPathString(path, "/actions/");
+            if (checkGet(exchange)) {
+                String response = actionTracker.getAction(actionId);
+                int statusCode = response.contains("\"error\":true") ? 404 : 200;
+                sendJson(exchange, statusCode, response);
+            }
+            return;
+        }
+
+        sendJson(exchange, 404, JsonBuilder.error(404, "Unknown actions endpoint"));
     }
 
     // ==================== UTILITIES ====================
@@ -500,7 +673,7 @@ public class LLMApiServer {
         exchange.getResponseHeaders().add("Content-Type", "application/json");
         exchange.getResponseHeaders().add("Access-Control-Allow-Origin", "*");
         exchange.getResponseHeaders().add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        exchange.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type");
+        exchange.getResponseHeaders().add("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key");
 
         byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
         exchange.sendResponseHeaders(statusCode, bytes.length);
@@ -559,6 +732,44 @@ public class LLMApiServer {
         return Integer.parseInt(numStr);
     }
 
+    private String extractPathString(String path, String prefix) {
+        String value = path.substring(prefix.length());
+        int endIdx = value.indexOf('/');
+        if (endIdx > 0) {
+            value = value.substring(0, endIdx);
+        }
+        return value;
+    }
+
+    private String extractPathString(String path, String prefix, String suffix) {
+        String value = path.substring(prefix.length());
+        int endIdx = value.indexOf(suffix);
+        if (endIdx > 0) {
+            value = value.substring(0, endIdx);
+        }
+        return value;
+    }
+
+    private void submitTrackedAction(
+            HttpExchange exchange,
+            String type,
+            String body,
+            String targetInfoJson,
+            ActionTracker.ActionExecutor executor
+    ) throws IOException {
+        String idempotencyKey = exchange.getRequestHeaders().getFirst("Idempotency-Key");
+        String requestBody = body == null ? "{}" : body;
+        ActionTracker.SubmitResult result = actionTracker.submit(
+                type,
+                exchange.getRequestURI().getPath(),
+                requestBody,
+                idempotencyKey,
+                targetInfoJson,
+                executor
+        );
+        sendJson(exchange, result.getStatusCode(), result.getResponseBody());
+    }
+
     // ==================== DOCUMENTATION ====================
 
     private String getDocumentation() {
@@ -582,8 +793,8 @@ public class LLMApiServer {
         json.key("npcs").startObject();
         json.field("GET /npcs", "List all nearby NPCs");
         json.field("GET /npcs/{index}", "Detailed info for specific NPC by index");
-        json.field("POST /npcs/{index}/interact", "Interact with NPC. Body: {\"action\": int|string}");
-        json.field("POST /npcs/{index}/use-item", "Use inventory item on NPC. Body: {\"itemId\": int}");
+        json.field("POST /npcs/{index}/interact", "Submit NPC interaction. Returns {accepted, actionId, submittedTick}. Body: {\"action\": int|string}");
+        json.field("POST /npcs/{index}/use-item", "Submit use-item on NPC. Returns {accepted, actionId, submittedTick}. Body: {\"itemId\": int}");
         json.endObject();
 
         // Objects
@@ -632,7 +843,15 @@ public class LLMApiServer {
 
         // State
         json.key("state").startObject();
-        json.field("GET /state", "Batched snapshot: player, combatTarget, npcs, ground_items, inventory, objects, dialogue, recentMessages");
+        json.field("GET /state", "Batched snapshot: player, combatTarget, npcs (with hasTarget), npcsTargetingPlayer, ground_items, inventory, objects, dialogue, recentMessages");
+        json.endObject();
+
+        // Action tracking
+        json.key("actions").startObject();
+        json.field("GET /actions/{actionId}", "Get detailed status for a submitted action (includes attemptSucceeded, intentSatisfied, intentReason, evidence)");
+        json.field("GET /actions?limit=&status=", "List recent actions (optional status filter)");
+        json.field("POST /actions/{actionId}/cancel", "Cancel a queued action");
+        json.field("GET /actions/stream", "SSE stream of action.update/action.terminal events");
         json.endObject();
 
         // Health

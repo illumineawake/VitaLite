@@ -508,6 +508,23 @@ public class DataHandlers {
         }
         json.endArray();
 
+        // NPCs currently targeting local player
+        json.key("npcsTargetingPlayer").startArray();
+        if (local != null) {
+            List<NpcEx> targetingPlayer = new NpcQuery()
+                    .keepIf(npc -> {
+                        ActorEx<?> interacting = npc.getInteracting();
+                        return interacting != null
+                                && interacting.equals(local)
+                                && hasAttackAction(npc.getActions());
+                    })
+                    .collect();
+            for (NpcEx npc : targetingPlayer) {
+                json.rawJson(NpcDTO.toJsonBrief(npc));
+            }
+        }
+        json.endArray();
+
         // Ground items (limit to 15)
         List<TileItemEx> groundItems = new TileItemQuery().collect();
         json.key("ground_items").startArray();
@@ -618,6 +635,7 @@ public class DataHandlers {
         json.field("id", target.getId());
         json.field("name", target.getName());
         json.field("combatLevel", target.getCombatLevel());
+        json.field("isDead", target.isDead());
 
         WorldPoint position = target.getWorldPoint();
         if (position != null) {
