@@ -4,10 +4,16 @@ import com.tonic.api.entities.NpcAPI;
 import com.tonic.api.entities.PlayerAPI;
 import com.tonic.api.entities.TileItemAPI;
 import com.tonic.api.entities.TileObjectAPI;
+import com.tonic.api.game.CombatAPI;
+import com.tonic.api.game.SceneAPI;
+import com.tonic.api.widgets.BankAPI;
 import com.tonic.api.widgets.DialogueAPI;
 import com.tonic.api.widgets.EquipmentAPI;
 import com.tonic.api.widgets.InventoryAPI;
+import com.tonic.api.widgets.MakeXAPI;
+import com.tonic.data.AttackStyle;
 import com.tonic.data.EquipmentSlot;
+import com.tonic.data.locatables.BankLocations;
 import com.tonic.data.wrappers.*;
 import com.tonic.queries.*;
 import com.tonic.services.llmapi.util.JsonBuilder;
@@ -510,6 +516,220 @@ public class ActionHandlers {
         }
     }
 
+    // ==================== MAKEX ====================
+
+    public String makeXConfirm(String body) {
+        try {
+            Integer amount = parseAmount(body);
+            if (amount == null || amount <= 0) {
+                return JsonBuilder.error(400, "Invalid request body. Expected {\"amount\": int > 0, \"itemId\"?: int, \"itemName\"?: string}");
+            }
+            if (!MakeXAPI.isOpen()) {
+                return JsonBuilder.error(400, "MakeX interface is not open");
+            }
+
+            MakeXAPI.setAmount(amount);
+
+            Integer itemId = parseOptionalItemId(body);
+            String itemName = parseOptionalItemName(body);
+            boolean confirmed;
+            if (itemId != null) {
+                confirmed = MakeXAPI.confirm(itemId);
+            } else if (itemName != null && !itemName.trim().isEmpty()) {
+                confirmed = MakeXAPI.confirm(itemName);
+            } else {
+                return JsonBuilder.error(400, "Invalid request body. Provide either itemId or itemName");
+            }
+
+            if (!confirmed) {
+                return JsonBuilder.error(404, "Requested MakeX option not found");
+            }
+
+            return JsonBuilder.success("MakeX confirmed");
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to confirm MakeX: " + e.getMessage());
+        }
+    }
+
+    // ==================== BANK ====================
+
+    public String openBank() {
+        try {
+            if (BankAPI.isOpen()) {
+                return JsonBuilder.success("Bank already open");
+            }
+
+            final long timeoutMs = 12000L;
+            final long deadline = System.currentTimeMillis() + timeoutMs;
+            long nextPathAt = 0L;
+
+            while (System.currentTimeMillis() < deadline) {
+                if (BankAPI.isOpen()) {
+                    return JsonBuilder.success("Opened bank");
+                }
+
+                if (!tryOpenNearbyBank()) {
+                    long now = System.currentTimeMillis();
+                    if (now >= nextPathAt) {
+                        BankLocations.walkToNearest();
+                        nextPathAt = now + 1800L;
+                    }
+                }
+
+                Thread.sleep(200L);
+            }
+
+            return JsonBuilder.error(408, "Timed out opening bank");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return JsonBuilder.error(500, "Bank open interrupted");
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to open bank: " + e.getMessage());
+        }
+    }
+
+    public String closeBank() {
+        try {
+            if (!BankAPI.isOpen()) {
+                return JsonBuilder.success("Bank already closed");
+            }
+
+            BankAPI.close();
+            for (int i = 0; i < 8; i++) {
+                if (!BankAPI.isOpen()) {
+                    return JsonBuilder.success("Closed bank");
+                }
+                Thread.sleep(120L);
+            }
+            return JsonBuilder.error(500, "Bank close not confirmed");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return JsonBuilder.error(500, "Bank close interrupted");
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to close bank: " + e.getMessage());
+        }
+    }
+
+    public String depositInventory() {
+        try {
+            if (!BankAPI.isOpen()) {
+                return JsonBuilder.error(400, "Bank is not open");
+            }
+            BankAPI.depositAll();
+            return JsonBuilder.success("Deposit inventory submitted");
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to deposit inventory: " + e.getMessage());
+        }
+    }
+
+    public String depositEquipment() {
+        try {
+            if (!BankAPI.isOpen()) {
+                return JsonBuilder.error(400, "Bank is not open");
+            }
+            BankAPI.depositEquipment();
+            return JsonBuilder.success("Deposit equipment submitted");
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to deposit equipment: " + e.getMessage());
+        }
+    }
+
+    public String withdrawBankItem(String body) {
+        try {
+            if (!BankAPI.isOpen()) {
+                return JsonBuilder.error(400, "Bank is not open");
+            }
+
+            Integer amount = parseAmount(body);
+            if (amount == null) {
+                return JsonBuilder.error(400, "Invalid request body. Expected amount");
+            }
+            boolean noted = parseNoted(body, false);
+
+            Integer itemId = parseOptionalItemId(body);
+            String itemName = parseOptionalItemName(body);
+            if (itemId == null && (itemName == null || itemName.trim().isEmpty())) {
+                return JsonBuilder.error(400, "Invalid request body. Expected itemId or itemName");
+            }
+
+            if (itemId != null) {
+                if (!BankAPI.contains(itemId)) {
+                    return JsonBuilder.error(404, "Item not found in bank: " + itemId);
+                }
+                BankAPI.withdraw(itemId, amount, noted);
+                return JsonBuilder.success("Withdraw submitted for itemId " + itemId);
+            }
+
+            if (!BankAPI.contains(itemName)) {
+                return JsonBuilder.error(404, "Item not found in bank: " + itemName);
+            }
+            BankAPI.withdraw(itemName, amount, noted);
+            return JsonBuilder.success("Withdraw submitted for itemName " + itemName);
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to withdraw bank item: " + e.getMessage());
+        }
+    }
+
+    private boolean tryOpenNearbyBank() {
+        NpcEx banker = new NpcQuery()
+                .withNameContains("Banker")
+                .keepIf(n -> SceneAPI.losTileNextTo(n.getWorldPoint()) != null)
+                .nearest();
+        if (banker != null) {
+            NpcAPI.interact(banker, 2);
+            return true;
+        }
+
+        TileObjectEx bank = new TileObjectQuery()
+                .withNamesContains("Bank booth", "Bank chest")
+                .sortNearest()
+                .first();
+        if (bank != null && SceneAPI.losTileNextTo(bank.getWorldPoint()) != null) {
+            if (bank.getName() != null && bank.getName().contains("Bank booth")) {
+                TileObjectAPI.interact(bank, 1);
+            } else {
+                TileObjectAPI.interact(bank, 0);
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    // ==================== COMBAT ====================
+
+    public String setCombatStyle(String body) {
+        try {
+            Integer styleIndex = parseStyleIndex(body);
+            if (styleIndex == null) {
+                return JsonBuilder.error(400, "Invalid request body. Expected {\"styleIndex\": int}");
+            }
+
+            AttackStyle targetStyle = AttackStyle.fromIndex(styleIndex);
+            if (targetStyle == AttackStyle.UNKNOWN) {
+                return JsonBuilder.error(400, "Invalid styleIndex: " + styleIndex);
+            }
+
+            CombatAPI.setAttackStyle(targetStyle);
+
+            for (int i = 0; i < 8; i++) {
+                AttackStyle current = CombatAPI.getAttackStyle();
+                if (current != AttackStyle.UNKNOWN && current.getIndex() == styleIndex) {
+                    return JsonBuilder.success("Set combat style to index " + styleIndex + " (" + current.name() + ")");
+                }
+                Thread.sleep(120L);
+            }
+
+            AttackStyle current = CombatAPI.getAttackStyle();
+            return JsonBuilder.error(500, "Combat style not applied. Current style: " + current.name());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return JsonBuilder.error(500, "Combat style update interrupted");
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to set combat style: " + e.getMessage());
+        }
+    }
+
     // ==================== HELPER CLASSES AND METHODS ====================
 
     private static class ActionRequest {
@@ -643,6 +863,73 @@ public class ActionHandlers {
         }
 
         return -1;
+    }
+
+    private Integer parseStyleIndex(String body) {
+        if (body == null || body.isEmpty()) {
+            return null;
+        }
+        try {
+            String value = extractJsonValue(body, "styleIndex");
+            if (value == null) {
+                return null;
+            }
+            return Integer.parseInt(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Integer parseAmount(String body) {
+        if (body == null || body.isEmpty()) {
+            return null;
+        }
+        try {
+            String value = extractJsonValue(body, "amount");
+            if (value == null) {
+                return null;
+            }
+            return Integer.parseInt(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Integer parseOptionalItemId(String body) {
+        if (body == null || body.isEmpty()) {
+            return null;
+        }
+        try {
+            String value = extractJsonValue(body, "itemId");
+            if (value == null || value.trim().isEmpty()) {
+                return null;
+            }
+            return Integer.parseInt(value);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String parseOptionalItemName(String body) {
+        if (body == null || body.isEmpty()) {
+            return null;
+        }
+        String value = extractJsonValue(body, "itemName");
+        if (value == null || value.trim().isEmpty()) {
+            return null;
+        }
+        return value;
+    }
+
+    private boolean parseNoted(String body, boolean defaultValue) {
+        if (body == null || body.isEmpty()) {
+            return defaultValue;
+        }
+        String value = extractJsonValue(body, "noted");
+        if (value == null) {
+            return defaultValue;
+        }
+        return "true".equalsIgnoreCase(value);
     }
 
     /**

@@ -1,23 +1,36 @@
 package com.tonic.services.llmapi.handlers;
 
 import com.tonic.Static;
+import com.tonic.api.entities.NpcAPI;
+import com.tonic.api.entities.TileItemAPI;
+import com.tonic.api.entities.TileObjectAPI;
+import com.tonic.api.game.QuestAPI;
+import com.tonic.api.game.VarAPI;
+import com.tonic.api.widgets.BankAPI;
+import com.tonic.api.widgets.DialogueAPI;
 import com.tonic.api.widgets.EquipmentAPI;
 import com.tonic.api.widgets.InventoryAPI;
+import com.tonic.api.widgets.MakeXAPI;
 import com.tonic.data.EquipmentSlot;
 import com.tonic.data.wrappers.*;
 import com.tonic.queries.*;
 import com.tonic.services.GameManager;
-import com.tonic.api.widgets.DialogueAPI;
 import com.tonic.services.llmapi.dto.*;
+import com.tonic.services.llmapi.state.BankStateStore;
 import com.tonic.services.llmapi.state.RecentMessageStore;
 import com.tonic.services.llmapi.util.JsonBuilder;
 import net.runelite.api.Client;
 import net.runelite.api.CollisionData;
 import net.runelite.api.Player;
+import net.runelite.api.QuestState;
 import net.runelite.api.Skill;
+import net.runelite.api.VarPlayer;
 import net.runelite.api.coords.WorldPoint;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Handlers for GET endpoints - reading game state
@@ -79,7 +92,7 @@ public class DataHandlers {
     public String getNpcs() {
         try {
             return Static.invoke(() -> {
-                List<NpcEx> npcs = new NpcQuery().collect();
+                List<NpcEx> npcs = /*new NpcQuery().collect(); */NpcAPI.search().removeIf(n -> n.getName().isEmpty()).collect();
 
                 JsonBuilder json = new JsonBuilder();
                 json.startObject();
@@ -123,7 +136,7 @@ public class DataHandlers {
     public String getObjects() {
         try {
             return Static.invoke(() -> {
-                List<TileObjectEx> objects = new TileObjectQuery().collect();
+                List<TileObjectEx> objects = collectNearbyInteractiveObjects();
 
                 JsonBuilder json = new JsonBuilder();
                 json.startObject();
@@ -238,7 +251,7 @@ public class DataHandlers {
 
                 for (ItemEx item : items) {
                     if (item.getId() > 0) {
-                        json.rawJson(ItemDTO.toJsonBrief(item));
+                        json.rawJson(ItemDTO.toJson(item));
                     }
                 }
 
@@ -349,6 +362,59 @@ public class DataHandlers {
             });
         } catch (Exception e) {
             return JsonBuilder.error(500, "Failed to get skill: " + e.getMessage());
+        }
+    }
+
+    // ==================== QUESTS ====================
+
+    public String getCompletedQuests() {
+        return getQuestListByState(QuestState.FINISHED);
+    }
+
+    public String getUnfinishedQuests() {
+        try {
+            return Static.invoke(() -> {
+                Map<String, QuestState> allQuests = QuestAPI.getQuests();
+                int playerQuestPoints = VarAPI.getVarp(VarPlayer.QUEST_POINTS);
+
+                List<Map.Entry<String, QuestState>> filtered = new ArrayList<>();
+                if (allQuests != null) {
+                    for (Map.Entry<String, QuestState> entry : allQuests.entrySet()) {
+                        QuestState state = entry.getValue();
+                        if (state == QuestState.NOT_STARTED || state == QuestState.IN_PROGRESS) {
+                            filtered.add(entry);
+                        }
+                    }
+                }
+                filtered.sort(Comparator.comparing(Map.Entry::getKey));
+
+                JsonBuilder json = new JsonBuilder();
+                json.startObject();
+                json.field("count", filtered.size());
+                json.field("playerQuestPoints", playerQuestPoints);
+                json.key("quests").startArray();
+                for (Map.Entry<String, QuestState> entry : filtered) {
+                    json.startObject();
+                    json.field("name", entry.getKey());
+                    json.field("state", entry.getValue().name());
+                    json.endObject();
+                }
+                json.endArray();
+                json.endObject();
+                return json.toString();
+            });
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to get unfinished quests: " + e.getMessage());
+        }
+    }
+
+    // ==================== BANK ====================
+
+    public String getBankItems() {
+        try {
+            return Static.invoke(this::buildBankItemsJson);
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to get bank items: " + e.getMessage());
         }
     }
 
@@ -485,10 +551,17 @@ public class DataHandlers {
     }
 
     private String buildFullStateJson() {
+        if (BankAPI.isOpen()) {
+            return buildBankingStateJson();
+        }
+        return buildWorldStateJson();
+    }
+
+    private String buildWorldStateJson() {
         JsonBuilder json = new JsonBuilder();
         json.startObject();
+        json.field("mode", "WORLD");
 
-        // Local player
         PlayerEx local = PlayerEx.getLocal();
         if (local != null) {
             json.key("player").rawJson(LocalPlayerDTO.toJsonDirect(local));
@@ -498,17 +571,18 @@ public class DataHandlers {
             }
         }
 
-        // NPCs (limit to 20 nearest)
-        List<NpcEx> npcs = new NpcQuery().collect();
+        appendInterfaces(json);
+        appendEquipmentState(json);
+        appendSkillsState(json);
+        appendInventoryState(json);
+
+        List<NpcEx> npcs = new NpcQuery().within(20).collect();
         json.key("npcs").startArray();
-        int npcCount = 0;
         for (NpcEx npc : npcs) {
-            if (npcCount++ >= 20) break;
             json.rawJson(NpcDTO.toJsonBrief(npc));
         }
         json.endArray();
 
-        // NPCs currently targeting local player
         json.key("npcsTargetingPlayer").startArray();
         if (local != null) {
             List<NpcEx> targetingPlayer = new NpcQuery()
@@ -525,8 +599,10 @@ public class DataHandlers {
         }
         json.endArray();
 
-        // Ground items (limit to 15)
-        List<TileItemEx> groundItems = new TileItemQuery().collect();
+        List<TileItemEx> groundItems =/* new TileItemQuery().within(20).collect();*/
+        TileItemAPI.search().removeIf(o -> o.getName() == null || "null".equalsIgnoreCase(o.getName()))
+                .within(20)
+                .collect();
         json.key("ground_items").startArray();
         int itemCount = 0;
         for (TileItemEx item : groundItems) {
@@ -535,7 +611,131 @@ public class DataHandlers {
         }
         json.endArray();
 
-        // Inventory
+        List<TileObjectEx> objects = collectNearbyInteractiveObjects();
+        json.key("objects").startArray();
+        int objCount = 0;
+        for (TileObjectEx obj : objects) {
+            if (objCount++ >= 15) break;
+            json.rawJson(TileObjectDTO.toJsonBrief(obj));
+        }
+        json.endArray();
+
+        json.key("dialogue").rawJson(DialogueDTO.toJson());
+        json.fieldRaw("recentMessages", buildRecentMessagesJson());
+
+        json.endObject();
+        return json.toString();
+    }
+
+    private String buildBankingStateJson() {
+        JsonBuilder json = new JsonBuilder();
+        json.startObject();
+        json.field("mode", "BANKING");
+
+        PlayerEx local = PlayerEx.getLocal();
+        if (local != null) {
+            json.key("player").rawJson(buildBankingPlayerSummaryJson(local));
+        }
+
+        appendInterfaces(json);
+        json.key("bank").rawJson(buildBankItemsJson());
+        appendInventoryState(json);
+        appendEquipmentState(json);
+        appendSkillsState(json);
+
+        json.endObject();
+        return json.toString();
+    }
+
+    private String buildBankingPlayerSummaryJson(PlayerEx player) {
+        Client client = Static.getClient();
+        WorldPoint pos = player.getWorldPoint();
+
+        JsonBuilder json = new JsonBuilder();
+        json.startObject();
+        json.field("name", player.getName());
+        json.field("combatLevel", player.getCombatLevel());
+        if (pos != null) {
+            json.fieldRaw("position", JsonBuilder.position(pos.getX(), pos.getY(), pos.getPlane()));
+        } else {
+            json.fieldNull("position");
+        }
+
+        json.key("hitpoints").startObject();
+        json.field("current", client.getBoostedSkillLevel(Skill.HITPOINTS));
+        json.field("max", client.getRealSkillLevel(Skill.HITPOINTS));
+        json.endObject();
+
+        json.key("prayer").startObject();
+        json.field("current", client.getBoostedSkillLevel(Skill.PRAYER));
+        json.field("max", client.getRealSkillLevel(Skill.PRAYER));
+        json.endObject();
+
+        json.field("runEnergy", client.getEnergy() / 100);
+        json.endObject();
+        return json.toString();
+    }
+
+    private String buildBankItemsJson() {
+        JsonBuilder json = new JsonBuilder();
+        json.startObject();
+        boolean open = BankAPI.isOpen();
+        json.field("open", open);
+
+        if (open) {
+            List<ItemEx> items = BankAPI.search().collect();
+            BankStateStore.updateFromItems(items);
+            BankStateStore.BankSnapshot snapshot = BankStateStore.getSnapshot();
+
+            json.field("source", "LIVE");
+            json.field("count", items.size());
+            json.key("items").startArray();
+            for (ItemEx item : items) {
+                if (item.getId() > 0) {
+                    json.rawJson(ItemDTO.toJsonBrief(item));
+                }
+            }
+            json.endArray();
+            if (snapshot != null) {
+                json.field("lastUpdatedTick", snapshot.getLastUpdatedTick());
+                json.field("lastUpdatedAtMs", snapshot.getLastUpdatedAtMs());
+            }
+        } else {
+            BankStateStore.BankSnapshot snapshot = BankStateStore.getSnapshot();
+            if (snapshot == null || snapshot.getItems().isEmpty()) {
+                json.field("source", "NONE");
+                json.field("count", 0);
+                json.key("items").startArray();
+                json.endArray();
+                json.field("message", "Bank cache is empty. Open bank once this session to populate cached bank items.");
+                json.fieldNull("lastUpdatedTick");
+                json.fieldNull("lastUpdatedAtMs");
+            } else {
+                json.field("source", "CACHE");
+                json.field("count", snapshot.getItems().size());
+                json.key("items").startArray();
+                for (BankStateStore.BankItemSnapshot item : snapshot.getItems()) {
+                    json.rawJson(item.toJsonBrief());
+                }
+                json.endArray();
+                json.field("lastUpdatedTick", snapshot.getLastUpdatedTick());
+                json.field("lastUpdatedAtMs", snapshot.getLastUpdatedAtMs());
+            }
+        }
+
+        json.endObject();
+        return json.toString();
+    }
+
+    private void appendInterfaces(JsonBuilder json) {
+        json.key("interfaces").startObject();
+        json.field("dialogueOpen", DialogueAPI.dialoguePresent());
+        json.field("makeXOpen", MakeXAPI.isOpen());
+        json.field("bankOpen", BankAPI.isOpen());
+        json.endObject();
+    }
+
+    private void appendInventoryState(JsonBuilder json) {
         List<ItemEx> invItems = InventoryAPI.getItems();
         json.key("inventory").startArray();
         for (ItemEx item : invItems) {
@@ -546,23 +746,64 @@ public class DataHandlers {
         json.endArray();
         json.field("inv_count", (int) invItems.stream().filter(i -> i.getId() > 0).count());
         json.field("inv_free", InventoryAPI.getEmptySlots());
+    }
 
-        // Objects (limit to 15)
-        List<TileObjectEx> objects = new TileObjectQuery().collect();
-        json.key("objects").startArray();
-        int objCount = 0;
-        for (TileObjectEx obj : objects) {
-            if (objCount++ >= 15) break;
-            json.rawJson(TileObjectDTO.toJsonBrief(obj));
+    private void appendEquipmentState(JsonBuilder json) {
+        List<ItemEx> items = EquipmentAPI.getAll();
+        json.key("equipment").startArray();
+        for (ItemEx item : items) {
+            if (item.getId() > 0) {
+                json.rawJson(ItemDTO.toJsonBrief(item));
+            }
         }
         json.endArray();
+    }
 
-        // Dialogue
-        json.key("dialogue").rawJson(DialogueDTO.toJson());
-        json.fieldRaw("recentMessages", buildRecentMessagesJson());
+    private void appendSkillsState(JsonBuilder json) {
+        Client client = Static.getClient();
+        json.key("skills").startArray();
+        for (Skill skill : Skill.values()) {
+            int boosted = client.getBoostedSkillLevel(skill);
+            int real = client.getRealSkillLevel(skill);
+            json.rawJson(SkillDTO.toJsonBrief(skill, boosted, real));
+        }
+        json.endArray();
+    }
 
-        json.endObject();
-        return json.toString();
+    private String getQuestListByState(QuestState targetState) {
+        try {
+            return Static.invoke(() -> {
+                Map<String, QuestState> allQuests = QuestAPI.getQuests();
+                int playerQuestPoints = VarAPI.getVarp(VarPlayer.QUEST_POINTS);
+
+                List<Map.Entry<String, QuestState>> filtered = new ArrayList<>();
+                if (allQuests != null) {
+                    for (Map.Entry<String, QuestState> entry : allQuests.entrySet()) {
+                        if (entry.getValue() == targetState) {
+                            filtered.add(entry);
+                        }
+                    }
+                }
+                filtered.sort(Comparator.comparing(Map.Entry::getKey));
+
+                JsonBuilder json = new JsonBuilder();
+                json.startObject();
+                json.field("count", filtered.size());
+                json.field("playerQuestPoints", playerQuestPoints);
+                json.key("quests").startArray();
+                for (Map.Entry<String, QuestState> entry : filtered) {
+                    json.startObject();
+                    json.field("name", entry.getKey());
+                    json.field("state", entry.getValue().name());
+                    json.endObject();
+                }
+                json.endArray();
+                json.endObject();
+                return json.toString();
+            });
+        } catch (Exception e) {
+            return JsonBuilder.error(500, "Failed to get quests: " + e.getMessage());
+        }
     }
 
     private String buildRecentMessagesJson() {
@@ -660,6 +901,25 @@ public class DataHandlers {
 
         json.endObject();
         return json.toString();
+    }
+
+    private List<TileObjectEx> collectNearbyInteractiveObjects() {
+        return TileObjectAPI.search()
+                .removeIf(o -> o.getName() == null || "null".equalsIgnoreCase(o.getName()))
+                .within(20)
+                .removeIf(o -> {
+                    String[] actions = o.getActions();
+                    if (actions == null || actions.length == 0) {
+                        return true;
+                    }
+                    for (String action : actions) {
+                        if (action != null && !action.trim().isEmpty()) {
+                            return false;
+                        }
+                    }
+                    return true;
+                })
+                .collect();
     }
 
     private boolean hasAttackAction(String[] actions) {
