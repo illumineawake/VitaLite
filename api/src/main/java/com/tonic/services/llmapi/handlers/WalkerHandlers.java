@@ -130,7 +130,7 @@ public class WalkerHandlers {
             JsonBuilder json = new JsonBuilder();
             json.startObject();
             json.field("success", true);
-            json.field("message", "Started long-distance walk");
+            json.field("message", "Walker path started");
             json.fieldRaw("destination", JsonBuilder.position(request.x, request.y, plane));
             json.field("stepsRemaining", stepsRemaining);
             json.endObject();

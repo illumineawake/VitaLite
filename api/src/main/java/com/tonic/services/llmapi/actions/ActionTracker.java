@@ -1,20 +1,28 @@
 package com.tonic.services.llmapi.actions;
 
 import com.sun.net.httpserver.HttpExchange;
+import com.tonic.Static;
 import com.tonic.api.game.MovementAPI;
 import com.tonic.api.widgets.BankAPI;
 import com.tonic.api.widgets.EquipmentAPI;
 import com.tonic.api.widgets.InventoryAPI;
+import com.tonic.api.widgets.ShopAPI;
 import com.tonic.data.wrappers.ActorEx;
 import com.tonic.data.wrappers.ItemEx;
 import com.tonic.data.wrappers.NpcEx;
 import com.tonic.data.wrappers.PlayerEx;
+import com.tonic.data.wrappers.TileItemEx;
+import com.tonic.data.wrappers.TileObjectEx;
 import com.tonic.queries.NpcQuery;
 import com.tonic.queries.PlayerQuery;
 import com.tonic.services.GameManager;
+import com.tonic.services.llmapi.state.RecentGeOfferStore;
 import com.tonic.services.llmapi.state.RecentMessageStore;
 import com.tonic.services.llmapi.util.JsonBuilder;
+import com.tonic.services.llmapi.util.SmartInteractionSupport;
 import com.tonic.services.pathfinder.model.WalkerPath;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.coords.WorldPoint;
 
 import java.io.IOException;
@@ -50,7 +58,11 @@ public final class ActionTracker {
     private static final long COMBAT_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(10);
     private static final long WALK_LOCAL_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(8);
     private static final long WALKER_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(25);
+    private static final long SMART_INTERACTION_STALL_MS = TimeUnit.SECONDS.toMillis(8);
+    private static final long SMART_INTERACTION_HARD_CAP_MS = TimeUnit.MINUTES.toMillis(3);
     private static final long BANK_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(12);
+    private static final long SHOP_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(10);
+    private static final long WORLD_HOP_TIMEOUT_MS = TimeUnit.SECONDS.toMillis(20);
 
     private final AtomicLong sequence = new AtomicLong(1);
     private final Map<String, ActionRecord> actionsById = new ConcurrentHashMap<>();
@@ -90,6 +102,11 @@ public final class ActionTracker {
         STILL_MOVING,
         INTERFACE_BLOCKED,
         INTERRUPTED,
+        GE_PRICE_TOO_LOW,
+        GE_OFFER_NOT_FILLED,
+        GE_SLOT_UNAVAILABLE,
+        GE_INTERFACE_CLOSED,
+        GE_OFFER_START_FAILED,
         IDEMPOTENCY_CONFLICT,
         CANCELED_BY_REQUEST,
         EXPIRED,
@@ -139,8 +156,18 @@ public final class ActionTracker {
         private final int inventoryCount;
         private final int equipmentCount;
         private final java.util.Map<Integer, Integer> inventoryQuantities;
+        private final java.util.Map<String, Integer> inventoryNameQuantities;
 
-        private PreExecutionSnapshot(int localX, int localY, int localPlane, int walkerSteps, int inventoryCount, int equipmentCount, java.util.Map<Integer, Integer> inventoryQuantities) {
+        private PreExecutionSnapshot(
+                int localX,
+                int localY,
+                int localPlane,
+                int walkerSteps,
+                int inventoryCount,
+                int equipmentCount,
+                java.util.Map<Integer, Integer> inventoryQuantities,
+                java.util.Map<String, Integer> inventoryNameQuantities
+        ) {
             this.localX = localX;
             this.localY = localY;
             this.localPlane = localPlane;
@@ -148,6 +175,7 @@ public final class ActionTracker {
             this.inventoryCount = inventoryCount;
             this.equipmentCount = equipmentCount;
             this.inventoryQuantities = inventoryQuantities;
+            this.inventoryNameQuantities = inventoryNameQuantities;
         }
     }
 
@@ -203,6 +231,10 @@ public final class ActionTracker {
         private volatile boolean intentSatisfied;
         private volatile String intentReason;
         private volatile String evidenceJson;
+        private volatile String smartPhase;
+        private volatile boolean smartWalkRequired;
+        private volatile boolean smartInteractionSubmitted;
+        private volatile String smartApproachTileJson;
 
         private ActionRecord(
                 String actionId,
@@ -236,6 +268,10 @@ public final class ActionTracker {
             this.intentSatisfied = false;
             this.intentReason = null;
             this.evidenceJson = "{\"recentMessages\":[],\"stateHints\":{}}";
+            this.smartPhase = null;
+            this.smartWalkRequired = false;
+            this.smartInteractionSubmitted = false;
+            this.smartApproachTileJson = null;
         }
 
         private synchronized void setAttemptOutcome(boolean attemptSucceeded) {
@@ -248,6 +284,22 @@ public final class ActionTracker {
             if (evidenceJson != null && !evidenceJson.isEmpty()) {
                 this.evidenceJson = evidenceJson;
             }
+        }
+
+        private synchronized void setSmartState(String phase, boolean walkRequired, boolean interactionSubmitted, String approachTileJson) {
+            this.smartPhase = phase;
+            this.smartWalkRequired = walkRequired;
+            this.smartInteractionSubmitted = interactionSubmitted;
+            this.smartApproachTileJson = approachTileJson;
+        }
+
+        private synchronized void refreshEvidence(String intentReason, String evidenceJson) {
+            this.intentReason = intentReason;
+            if (evidenceJson != null && !evidenceJson.isEmpty()) {
+                this.evidenceJson = evidenceJson;
+            }
+            this.updatedAtMs = System.currentTimeMillis();
+            this.version += 1;
         }
 
         private synchronized boolean transition(
@@ -554,16 +606,22 @@ public final class ActionTracker {
 
                 if (!attemptSuccess) {
                     int code = extractJsonInt(result, "code", 500);
+                    String reasonToken = extractJsonString(result, "reasonCode");
                     String message = extractJsonString(result, "message");
-                    ReasonCode mapped = mapReason(code, message);
-                    record.setIntentOutcome(false, message, buildEvidenceJson(record, pre));
+                    ReasonCode mapped = mapReason(code, reasonToken, message);
+                    record.setIntentOutcome(false, message, buildEvidenceJson(record, pre, result));
                     record.transition(ActionStatus.FAILED, mapped, message, isRetryable(mapped), false, true);
+                    maybeRecordGeResolution(record, result);
                     publish(record);
                     continue;
                 }
 
                 IntentEvaluation evaluation;
-                if (isCombatIntentAction(record)) {
+                if (isSmartInteractionAction(record)) {
+                    record.transition(ActionStatus.WAITING_CONDITION, null, null, null, false, false);
+                    publish(record);
+                    evaluation = evaluateSmartInteractionIntent(record, pre);
+                } else if (isCombatIntentAction(record)) {
                     record.transition(ActionStatus.WAITING_CONDITION, null, null, null, false, false);
                     publish(record);
                     evaluation = evaluateCombatIntent(record, pre);
@@ -575,6 +633,14 @@ public final class ActionTracker {
                     record.transition(ActionStatus.WAITING_CONDITION, null, null, null, false, false);
                     publish(record);
                     evaluation = evaluateBankIntent(record, pre);
+                } else if (isShopIntentAction(record)) {
+                    record.transition(ActionStatus.WAITING_CONDITION, null, null, null, false, false);
+                    publish(record);
+                    evaluation = evaluateShopIntent(record, pre);
+                } else if (isWorldIntentAction(record)) {
+                    record.transition(ActionStatus.WAITING_CONDITION, null, null, null, false, false);
+                    publish(record);
+                    evaluation = evaluateWorldIntent(record, pre, result);
                 } else if (isImmediateIntentAction(record)) {
                     evaluation = new IntentEvaluation(
                             true,
@@ -583,17 +649,17 @@ public final class ActionTracker {
                             null,
                             "Immediate interface intent accepted",
                             false,
-                            buildEvidenceJson(record, pre)
+                            buildEvidenceJson(record, pre, result)
                     );
                 } else {
                     evaluation = new IntentEvaluation(
+                            true,
                             false,
+                            null,
+                            null,
+                            "Action execution succeeded (no dedicated post-condition evaluator for this action type)",
                             false,
-                            ReasonCode.UNKNOWN_ERROR,
-                            "Intent evaluator not implemented for action type",
-                            "Intent evaluator not implemented for action type",
-                            false,
-                            buildEvidenceJson(record, pre)
+                            buildEvidenceJson(record, pre, result)
                     );
                 }
 
@@ -607,6 +673,7 @@ public final class ActionTracker {
                     String reasonText = evaluation.reasonText == null ? "Intent not satisfied" : evaluation.reasonText;
                     record.transition(terminalStatus, reasonCode, reasonText, evaluation.retryable, false, true);
                 }
+                maybeRecordGeResolution(record, result);
                 publish(record);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -640,12 +707,18 @@ public final class ActionTracker {
         List<ItemEx> inventoryItems = InventoryAPI.getItems();
         int inventoryCount = 0;
         java.util.Map<Integer, Integer> quantities = new java.util.HashMap<>();
+        java.util.Map<String, Integer> nameQuantities = new java.util.HashMap<>();
         for (ItemEx item : inventoryItems) {
             if (item == null || item.getId() <= 0) {
                 continue;
             }
             inventoryCount++;
             quantities.put(item.getId(), quantities.getOrDefault(item.getId(), 0) + item.getQuantity());
+            String name = item.getName();
+            if (name != null && !name.isEmpty()) {
+                String key = name.toLowerCase();
+                nameQuantities.put(key, nameQuantities.getOrDefault(key, 0) + item.getQuantity());
+            }
         }
 
         int equipmentCount = 0;
@@ -655,7 +728,7 @@ public final class ActionTracker {
             }
         }
 
-        return new PreExecutionSnapshot(x, y, plane, steps, inventoryCount, equipmentCount, quantities);
+        return new PreExecutionSnapshot(x, y, plane, steps, inventoryCount, equipmentCount, quantities, nameQuantities);
     }
 
     private IntentEvaluation evaluateCombatIntent(ActionRecord record, PreExecutionSnapshot pre) {
@@ -707,6 +780,21 @@ public final class ActionTracker {
         long deadline = System.currentTimeMillis() + timeoutMs;
 
         while (System.currentTimeMillis() < deadline) {
+            if ("WALKER_WALK_TO".equals(record.type)) {
+                WalkerPath path = GameManager.getWalkerPath();
+                if (path != null && path.isCanceled()) {
+                    return new IntentEvaluation(
+                            false,
+                            false,
+                            ReasonCode.CANCELED_BY_REQUEST,
+                            "Walker path was canceled before reaching destination",
+                            "Walker path entered canceled state",
+                            false,
+                            buildEvidenceJson(record, pre)
+                    );
+                }
+            }
+
             if (isMovementIntentSatisfied(record, pre)) {
                 return new IntentEvaluation(
                         true,
@@ -721,15 +809,386 @@ public final class ActionTracker {
             sleepQuietly(WAIT_POLL_MS);
         }
 
+        if (isMovementIntentSatisfiedRelaxed(record)) {
+            return new IntentEvaluation(
+                    true,
+                    false,
+                    null,
+                    null,
+                    "Movement intent reached relaxed destination tolerance",
+                    false,
+                    buildEvidenceJson(record, pre)
+            );
+        }
+
+        if ("WALKER_WALK_TO".equals(record.type)) {
+            WalkerPath path = GameManager.getWalkerPath();
+            if (path != null && path.isCanceled()) {
+                return new IntentEvaluation(
+                        false,
+                        false,
+                        ReasonCode.CANCELED_BY_REQUEST,
+                        "Walker path was canceled before reaching destination",
+                        "Walker path entered canceled state",
+                        false,
+                        buildEvidenceJson(record, pre)
+                );
+            }
+
+            if (path != null && !path.isDone() && !path.isCanceled()) {
+                int currentSteps = path.getSteps() == null ? 0 : path.getSteps().size();
+                if (pre != null && pre.walkerSteps >= 0 && currentSteps >= pre.walkerSteps && !MovementAPI.isMoving()) {
+                    return new IntentEvaluation(
+                            false,
+                            true,
+                            ReasonCode.STILL_MOVING,
+                            "Walker path made no observable progress before timeout",
+                            "Walker remained active without step reduction or movement",
+                            true,
+                            buildEvidenceJson(record, pre)
+                    );
+                }
+            }
+        }
+
         return new IntentEvaluation(
                 false,
                 true,
-                ReasonCode.PATH_BLOCKED,
+                ReasonCode.TIMEOUT,
                 "Movement intent not satisfied before timeout",
                 "Destination or movement progression was not confirmed",
                 true,
                 buildEvidenceJson(record, pre)
         );
+    }
+
+    private IntentEvaluation evaluateSmartInteractionIntent(ActionRecord record, PreExecutionSnapshot pre) {
+        long startedAt = System.currentTimeMillis();
+        long deadline = startedAt + SMART_INTERACTION_HARD_CAP_MS;
+        long lastProgressAt = startedAt;
+        long lastPublishAt = 0L;
+        WorldPoint lastPosition = getLocalPosition();
+        int lastWalkerSteps = getCurrentWalkerSteps();
+        int settledReadyPolls = 0;
+
+        setSmartPhase(record, "RESOLVING", false, false, null, "Resolving smart interaction target", pre, true);
+
+        while (System.currentTimeMillis() < deadline) {
+            NpcEx npc = null;
+            TileObjectEx object = null;
+            TileItemEx groundItem = null;
+            boolean reachable;
+
+            if ("NPC_SMART_INTERACT".equals(record.type) || "NPC_SMART_USE_ITEM".equals(record.type)) {
+                npc = SmartInteractionSupport.resolveNpc(extractJsonInt(record.targetInfoJson, "npcIndex", -1));
+                if (npc == null) {
+                    return new IntentEvaluation(
+                            false,
+                            false,
+                            ReasonCode.INVALID_TARGET,
+                            "Smart interaction target no longer exists",
+                            "Target NPC could not be re-resolved",
+                            false,
+                            buildEvidenceJson(record, pre)
+                    );
+                }
+                reachable = SmartInteractionSupport.canInteract(npc);
+            } else if ("OBJECT_SMART_INTERACT".equals(record.type) || "OBJECT_SMART_USE_ITEM".equals(record.type)) {
+                WorldPoint reference = getSmartReferencePoint(record);
+                object = SmartInteractionSupport.resolveObject(extractJsonInt(record.targetInfoJson, "objectId", -1), reference);
+                if (object == null) {
+                    return new IntentEvaluation(
+                            false,
+                            false,
+                            ReasonCode.INVALID_TARGET,
+                            "Smart interaction target no longer exists",
+                            "Target object could not be re-resolved",
+                            false,
+                            buildEvidenceJson(record, pre)
+                    );
+                }
+                reachable = SmartInteractionSupport.canInteract(object);
+            } else {
+                WorldPoint reference = getSmartReferencePoint(record);
+                groundItem = SmartInteractionSupport.resolveGroundItem(extractJsonInt(record.targetInfoJson, "groundItemId", -1), reference);
+                if (groundItem == null) {
+                    return new IntentEvaluation(
+                            false,
+                            false,
+                            ReasonCode.INVALID_TARGET,
+                            "Smart interaction target no longer exists",
+                            "Target ground item could not be re-resolved",
+                            false,
+                            buildEvidenceJson(record, pre)
+                    );
+                }
+                reachable = SmartInteractionSupport.canInteract(groundItem);
+            }
+
+            if (reachable) {
+                WalkerPath path = GameManager.getWalkerPath();
+                boolean movementSettled = !MovementAPI.isMoving();
+                boolean walkerSettled = !record.smartWalkRequired
+                        || path == null
+                        || path.isDone()
+                        || path.isCanceled()
+                        || (path.getSteps() != null && path.getSteps().isEmpty());
+
+                if (!record.smartInteractionSubmitted) {
+                    if (movementSettled && walkerSettled) {
+                        settledReadyPolls++;
+                    } else {
+                        settledReadyPolls = 0;
+                    }
+
+                    if (settledReadyPolls < 2) {
+                        String waitReason = movementSettled && !walkerSettled
+                                ? "Target reachable; waiting for walker to settle"
+                                : "Target reachable; waiting for movement to settle";
+                        setSmartPhase(record, "READY_TO_INTERACT", record.smartWalkRequired, false, record.smartApproachTileJson, waitReason, pre, false);
+                        sleepQuietly(WAIT_POLL_MS);
+                        continue;
+                    }
+                }
+
+                setSmartPhase(record, "READY_TO_INTERACT", record.smartWalkRequired, record.smartInteractionSubmitted, record.smartApproachTileJson, "Target is reachable and settled", pre, false);
+
+                if (!record.smartInteractionSubmitted) {
+                    int actionIndex = extractJsonInt(record.requestPayloadJson, "action", -1);
+                    String actionName = extractJsonString(record.requestPayloadJson, "action");
+                    int itemId = extractJsonInt(record.requestPayloadJson, "itemId", -1);
+
+                    try {
+                        if (npc != null) {
+                            if ("NPC_SMART_INTERACT".equals(record.type)) {
+                                if (!SmartInteractionSupport.hasAction(npc.getActions(), actionIndex, actionName)) {
+                                    return new IntentEvaluation(
+                                            false,
+                                            false,
+                                            ReasonCode.MENU_ACTION_UNAVAILABLE,
+                                            "Menu action unavailable for NPC",
+                                            "Resolved NPC does not expose the requested action",
+                                            false,
+                                            buildEvidenceJson(record, pre)
+                                    );
+                                }
+                                SmartInteractionSupport.interactNpc(npc, actionIndex, actionName);
+                            } else {
+                                if (SmartInteractionSupport.requireInventoryItem(itemId) == null) {
+                                    return new IntentEvaluation(
+                                            false,
+                                            false,
+                                            ReasonCode.INVALID_TARGET,
+                                            "Inventory item not available for smart use-item",
+                                            "Required inventory item could not be found before final interaction",
+                                            false,
+                                            buildEvidenceJson(record, pre)
+                                    );
+                                }
+                                SmartInteractionSupport.useItemOnNpc(npc, itemId);
+                            }
+                        } else if (object != null) {
+                            if ("OBJECT_SMART_INTERACT".equals(record.type)) {
+                                if (!SmartInteractionSupport.hasAction(object.getActions(), actionIndex, actionName)) {
+                                    return new IntentEvaluation(
+                                            false,
+                                            false,
+                                            ReasonCode.MENU_ACTION_UNAVAILABLE,
+                                            "Menu action unavailable for object",
+                                            "Resolved object does not expose the requested action",
+                                            false,
+                                            buildEvidenceJson(record, pre)
+                                    );
+                                }
+                                SmartInteractionSupport.interactObject(object, actionIndex, actionName);
+                            } else {
+                                if (SmartInteractionSupport.requireInventoryItem(itemId) == null) {
+                                    return new IntentEvaluation(
+                                            false,
+                                            false,
+                                            ReasonCode.INVALID_TARGET,
+                                            "Inventory item not available for smart use-item",
+                                            "Required inventory item could not be found before final interaction",
+                                            false,
+                                            buildEvidenceJson(record, pre)
+                                    );
+                                }
+                                SmartInteractionSupport.useItemOnObject(object, itemId);
+                            }
+                        } else if (groundItem != null) {
+                            if ("GROUND_ITEM_SMART_USE_ITEM".equals(record.type)) {
+                                if (SmartInteractionSupport.requireInventoryItem(itemId) == null) {
+                                    return new IntentEvaluation(
+                                            false,
+                                            false,
+                                            ReasonCode.INVALID_TARGET,
+                                            "Inventory item not available for smart use-item",
+                                            "Required inventory item could not be found before final interaction",
+                                            false,
+                                            buildEvidenceJson(record, pre)
+                                    );
+                                }
+                                SmartInteractionSupport.useItemOnGroundItem(groundItem, itemId);
+                            } else {
+                                SmartInteractionSupport.interactGroundItem(groundItem);
+                            }
+                        }
+                    } catch (Exception e) {
+                        return new IntentEvaluation(
+                                false,
+                                false,
+                                ReasonCode.UNKNOWN_ERROR,
+                                "Smart interaction submit failed: " + e.getMessage(),
+                                "Final interaction attempt threw an exception",
+                                true,
+                                buildEvidenceJson(record, pre)
+                        );
+                    }
+
+                    setSmartPhase(record, "INTERACT_SUBMITTED", record.smartWalkRequired, true, record.smartApproachTileJson, "Final interaction submitted", pre, true);
+
+                    if (isSmartCombatAction(record)) {
+                        return evaluateCombatIntent(record, pre);
+                    }
+
+                    return new IntentEvaluation(
+                            true,
+                            false,
+                            null,
+                            null,
+                            "Smart interaction submitted after target became reachable and settled",
+                            false,
+                            buildEvidenceJson(record, pre)
+                    );
+                }
+            } else {
+                settledReadyPolls = 0;
+                WalkerPath path = GameManager.getWalkerPath();
+                if (path == null || path.isDone() || path.isCanceled()) {
+                    WorldPoint approachTile = npc != null
+                            ? SmartInteractionSupport.getApproachTile(npc)
+                            : object != null
+                            ? SmartInteractionSupport.getApproachTile(object)
+                            : SmartInteractionSupport.getApproachTile(groundItem);
+
+                    if (approachTile == null) {
+                        return new IntentEvaluation(
+                                false,
+                                false,
+                                ReasonCode.PATH_BLOCKED,
+                                "No valid approach tile found for smart interaction target",
+                                "Reachable approach tile could not be derived",
+                                true,
+                                buildEvidenceJson(record, pre)
+                        );
+                    }
+
+                    SmartInteractionSupport.startWalker(approachTile);
+                    setSmartPhase(record, "APPROACHING", true, record.smartInteractionSubmitted, positionJson(approachTile), "Approaching target", pre, true);
+                    path = GameManager.getWalkerPath();
+                } else {
+                    setSmartPhase(record, "APPROACHING", true, record.smartInteractionSubmitted, record.smartApproachTileJson, "Approaching target", pre, false);
+                }
+            }
+
+            long now = System.currentTimeMillis();
+            WorldPoint currentPosition = getLocalPosition();
+            int currentWalkerSteps = getCurrentWalkerSteps();
+            boolean progressed = hasSmartInteractionProgress(lastPosition, currentPosition, lastWalkerSteps, currentWalkerSteps);
+            if (progressed) {
+                lastProgressAt = now;
+                lastPosition = currentPosition;
+                lastWalkerSteps = currentWalkerSteps;
+                if ((now - lastPublishAt) >= 1000L) {
+                    record.refreshEvidence(record.intentReason, buildEvidenceJson(record, pre));
+                    publish(record);
+                    lastPublishAt = now;
+                }
+            } else if ((now - lastProgressAt) >= SMART_INTERACTION_STALL_MS) {
+                return new IntentEvaluation(
+                        false,
+                        true,
+                        ReasonCode.TIMEOUT,
+                        "Smart interaction stalled before target became reachable",
+                        "No walker step reduction or position change was observed during approach",
+                        true,
+                        buildEvidenceJson(record, pre)
+                );
+            }
+
+            sleepQuietly(WAIT_POLL_MS);
+        }
+
+        return new IntentEvaluation(
+                false,
+                true,
+                ReasonCode.TIMEOUT,
+                "Smart interaction exceeded hard timeout",
+                "Smart interaction did not complete before the safety cap",
+                true,
+                buildEvidenceJson(record, pre)
+        );
+    }
+
+    private void setSmartPhase(
+            ActionRecord record,
+            String phase,
+            boolean walkRequired,
+            boolean interactionSubmitted,
+            String approachTileJson,
+            String intentReason,
+            PreExecutionSnapshot pre,
+            boolean publishUpdate
+    ) {
+        boolean changed = !Objects.equals(record.smartPhase, phase)
+                || record.smartWalkRequired != walkRequired
+                || record.smartInteractionSubmitted != interactionSubmitted
+                || !Objects.equals(record.smartApproachTileJson, approachTileJson);
+
+        record.setSmartState(phase, walkRequired, interactionSubmitted, approachTileJson);
+        if (changed || publishUpdate) {
+            record.refreshEvidence(intentReason, buildEvidenceJson(record, pre));
+            if (publishUpdate) {
+                publish(record);
+            }
+        }
+    }
+
+    private WorldPoint getLocalPosition() {
+        PlayerEx local = PlayerEx.getLocal();
+        return local == null ? null : local.getWorldPoint();
+    }
+
+    private int getCurrentWalkerSteps() {
+        WalkerPath path = GameManager.getWalkerPath();
+        if (path == null || path.getSteps() == null) {
+            return -1;
+        }
+        return path.getSteps().size();
+    }
+
+    private WorldPoint getSmartReferencePoint(ActionRecord record) {
+        int x = extractJsonInt(record.requestPayloadJson, "x", -1);
+        int y = extractJsonInt(record.requestPayloadJson, "y", -1);
+        int plane = extractJsonInt(record.requestPayloadJson, "plane", -1);
+        if (x < 0 || y < 0 || plane < 0) {
+            return null;
+        }
+        return new WorldPoint(x, y, plane);
+    }
+
+    private boolean hasSmartInteractionProgress(WorldPoint previousPosition, WorldPoint currentPosition, int previousWalkerSteps, int currentWalkerSteps) {
+        if (previousPosition != null && currentPosition != null && previousPosition.distanceTo(currentPosition) >= 1) {
+            return true;
+        }
+        return previousWalkerSteps >= 0 && currentWalkerSteps >= 0 && currentWalkerSteps < previousWalkerSteps;
+    }
+
+    private String positionJson(WorldPoint point) {
+        if (point == null) {
+            return null;
+        }
+        return JsonBuilder.position(point.getX(), point.getY(), point.getPlane());
     }
 
     private IntentEvaluation evaluateBankIntent(ActionRecord record, PreExecutionSnapshot pre) {
@@ -746,6 +1205,9 @@ public final class ActionTracker {
             }
             if ("BANK_DEPOSIT_EQUIPMENT".equals(record.type) && isEquipmentDepositSatisfied(pre)) {
                 return new IntentEvaluation(true, false, null, null, "Equipment deposit observed", false, buildEvidenceJson(record, pre));
+            }
+            if ("BANK_DEPOSIT_ALL_OF_ITEM".equals(record.type) && isDepositAllOfItemSatisfied(record, pre)) {
+                return new IntentEvaluation(true, false, null, null, "Item-specific deposit observed", false, buildEvidenceJson(record, pre));
             }
             if ("BANK_WITHDRAW".equals(record.type) && isWithdrawSatisfied(record, pre)) {
                 return new IntentEvaluation(true, false, null, null, "Withdraw observed in inventory", false, buildEvidenceJson(record, pre));
@@ -764,12 +1226,66 @@ public final class ActionTracker {
         );
     }
 
+    private IntentEvaluation evaluateShopIntent(ActionRecord record, PreExecutionSnapshot pre) {
+        long deadline = System.currentTimeMillis() + SHOP_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            if ("SHOP_CLOSE".equals(record.type) && !ShopAPI.isOpen()) {
+                return new IntentEvaluation(true, false, null, null, "Shop interface closed", false, buildEvidenceJson(record, pre));
+            }
+            if ("SHOP_BUY".equals(record.type) && isShopBuySatisfied(record, pre)) {
+                return new IntentEvaluation(true, false, null, null, "Shop buy observed in inventory", false, buildEvidenceJson(record, pre));
+            }
+            if ("SHOP_SELL".equals(record.type) && isShopSellSatisfied(record, pre)) {
+                return new IntentEvaluation(true, false, null, null, "Shop sell observed in inventory", false, buildEvidenceJson(record, pre));
+            }
+            sleepQuietly(WAIT_POLL_MS);
+        }
+
+        return new IntentEvaluation(
+                false,
+                true,
+                ReasonCode.TIMEOUT,
+                "Shop action intent not satisfied before timeout",
+                "Shop action did not produce expected inventory/interface state in time",
+                true,
+                buildEvidenceJson(record, pre)
+        );
+    }
+
     private boolean isCombatIntentAction(ActionRecord record) {
         if (!"NPC_INTERACT".equals(record.type) && !"PLAYER_INTERACT".equals(record.type)) {
             return false;
         }
         String actionName = extractJsonString(record.requestPayloadJson, "action");
         return actionName != null && actionName.equalsIgnoreCase("Attack");
+    }
+
+    private boolean isSmartInteractionAction(ActionRecord record) {
+        return "NPC_SMART_INTERACT".equals(record.type)
+                || "NPC_SMART_USE_ITEM".equals(record.type)
+                || "OBJECT_SMART_INTERACT".equals(record.type)
+                || "OBJECT_SMART_USE_ITEM".equals(record.type)
+                || "GROUND_ITEM_SMART_INTERACT".equals(record.type)
+                || "GROUND_ITEM_SMART_USE_ITEM".equals(record.type);
+    }
+
+    private boolean isSmartCombatAction(ActionRecord record) {
+        if (!"NPC_SMART_INTERACT".equals(record.type)) {
+            return false;
+        }
+        String actionName = extractJsonString(record.requestPayloadJson, "action");
+        if (actionName != null && actionName.equalsIgnoreCase("Attack")) {
+            return true;
+        }
+        int actionIndex = extractJsonInt(record.requestPayloadJson, "action", -1);
+        NpcEx npc = SmartInteractionSupport.resolveNpc(extractJsonInt(record.targetInfoJson, "npcIndex", -1));
+        String[] actions = npc == null ? null : npc.getActions();
+        return npc != null
+                && actions != null
+                && actionIndex >= 0
+                && actionIndex < actions.length
+                && actions[actionIndex] != null
+                && "Attack".equalsIgnoreCase(actions[actionIndex]);
     }
 
     private boolean isMovementIntentAction(ActionRecord record) {
@@ -785,11 +1301,62 @@ public final class ActionTracker {
                 || "BANK_CLOSE".equals(record.type)
                 || "BANK_DEPOSIT_INVENTORY".equals(record.type)
                 || "BANK_DEPOSIT_EQUIPMENT".equals(record.type)
+                || "BANK_DEPOSIT_ALL_OF_ITEM".equals(record.type)
                 || "BANK_WITHDRAW".equals(record.type);
     }
 
+    private boolean isShopIntentAction(ActionRecord record) {
+        return "SHOP_BUY".equals(record.type)
+                || "SHOP_SELL".equals(record.type)
+                || "SHOP_CLOSE".equals(record.type);
+    }
+
+    private boolean isWorldIntentAction(ActionRecord record) {
+        return "WORLD_HOP".equals(record.type)
+                || "WORLD_HOP_RANDOM_SAME_COUNTRY".equals(record.type);
+    }
+
     private boolean isImmediateIntentAction(ActionRecord record) {
-        return "MAKE_X_CONFIRM".equals(record.type);
+        return "MAKE_X_CONFIRM".equals(record.type)
+                || "WIDGET_INTERACT".equals(record.type)
+                || "WIDGET_CLICK".equals(record.type);
+    }
+
+    private IntentEvaluation evaluateWorldIntent(ActionRecord record, PreExecutionSnapshot pre, String executionResultJson) {
+        int targetWorldId = extractJsonInt(record.targetInfoJson, "worldId", -1);
+        if (targetWorldId < 0) {
+            targetWorldId = extractJsonInt(record.requestPayloadJson, "worldId", -1);
+        }
+        if (targetWorldId < 0) {
+            targetWorldId = extractJsonInt(executionResultJson, "worldId", -1);
+        }
+
+        long deadline = System.currentTimeMillis() + WORLD_HOP_TIMEOUT_MS;
+        while (System.currentTimeMillis() < deadline) {
+            Client client = Static.getClient();
+            if (client != null && targetWorldId > 0 && client.getWorld() == targetWorldId && client.getGameState() != GameState.HOPPING) {
+                return new IntentEvaluation(
+                        true,
+                        false,
+                        null,
+                        null,
+                        "World hop observed on target world",
+                        false,
+                        buildEvidenceJson(record, pre, executionResultJson)
+                );
+            }
+            sleepQuietly(WAIT_POLL_MS);
+        }
+
+        return new IntentEvaluation(
+                false,
+                true,
+                ReasonCode.TIMEOUT,
+                "World hop intent not satisfied before timeout",
+                "World did not switch to the requested target in time",
+                true,
+                buildEvidenceJson(record, pre, executionResultJson)
+        );
     }
 
     private boolean isWalkerAction(String type) {
@@ -852,6 +1419,36 @@ public final class ActionTracker {
         return false;
     }
 
+    private boolean isMovementIntentSatisfiedRelaxed(ActionRecord record) {
+        if (!"WALKER_WALK_TO".equals(record.type)) {
+            return false;
+        }
+
+        PlayerEx local = PlayerEx.getLocal();
+        if (local == null || local.getWorldPoint() == null) {
+            return false;
+        }
+
+        WorldPoint localPoint = local.getWorldPoint();
+        int targetX = extractJsonInt(record.requestPayloadJson, "x", -1);
+        int targetY = extractJsonInt(record.requestPayloadJson, "y", -1);
+        int targetPlane = extractJsonInt(record.requestPayloadJson, "plane", localPoint.getPlane());
+        if (targetX < 0 || targetY < 0 || localPoint.getPlane() != targetPlane) {
+            return false;
+        }
+
+        int distance = Math.max(Math.abs(localPoint.getX() - targetX), Math.abs(localPoint.getY() - targetY));
+        if (distance > 2) {
+            return false;
+        }
+
+        WalkerPath path = GameManager.getWalkerPath();
+        if (path == null) {
+            return true;
+        }
+        return path.isDone() || (!path.isCanceled() && !MovementAPI.isMoving());
+    }
+
     private boolean isInventoryDepositSatisfied(PreExecutionSnapshot pre) {
         if (pre.inventoryCount == 0) {
             return true;
@@ -903,6 +1500,99 @@ public final class ActionTracker {
         }
 
         return false;
+    }
+
+    private boolean isDepositAllOfItemSatisfied(ActionRecord record, PreExecutionSnapshot pre) {
+        Integer itemId = parseOptionalJsonInt(record.requestPayloadJson, "itemId");
+        if (itemId == null) {
+            return false;
+        }
+
+        int before = pre.inventoryQuantities.getOrDefault(itemId, 0);
+        if (before <= 0) {
+            return true;
+        }
+
+        int now = currentInventoryQuantityById(itemId);
+        return now < before;
+    }
+
+    private boolean isShopBuySatisfied(ActionRecord record, PreExecutionSnapshot pre) {
+        Integer itemId = parseOptionalJsonInt(record.requestPayloadJson, "itemId");
+        String itemName = extractJsonString(record.requestPayloadJson, "itemName");
+
+        if (itemId != null) {
+            int before = pre.inventoryQuantities.getOrDefault(itemId, 0);
+            int now = currentInventoryQuantityById(itemId);
+            return now > before;
+        }
+
+        if (itemName != null && !itemName.isEmpty()) {
+            int before = snapshotInventoryQuantityByName(pre, itemName);
+            int now = currentInventoryQuantityByName(itemName);
+            return now > before;
+        }
+
+        return false;
+    }
+
+    private boolean isShopSellSatisfied(ActionRecord record, PreExecutionSnapshot pre) {
+        Integer itemId = parseOptionalJsonInt(record.requestPayloadJson, "itemId");
+        String itemName = extractJsonString(record.requestPayloadJson, "itemName");
+
+        if (itemId != null) {
+            int before = pre.inventoryQuantities.getOrDefault(itemId, 0);
+            int now = currentInventoryQuantityById(itemId);
+            return now < before;
+        }
+
+        if (itemName != null && !itemName.isEmpty()) {
+            int before = snapshotInventoryQuantityByName(pre, itemName);
+            int now = currentInventoryQuantityByName(itemName);
+            return now < before;
+        }
+
+        return false;
+    }
+
+    private int currentInventoryQuantityById(int itemId) {
+        int total = 0;
+        for (ItemEx item : InventoryAPI.getItems()) {
+            if (item != null && item.getId() == itemId && item.getId() > 0) {
+                total += item.getQuantity();
+            }
+        }
+        return total;
+    }
+
+    private int currentInventoryQuantityByName(String itemName) {
+        String needle = itemName.toLowerCase();
+        int total = 0;
+        for (ItemEx item : InventoryAPI.getItems()) {
+            if (item == null || item.getId() <= 0 || item.getName() == null) {
+                continue;
+            }
+            String name = item.getName().toLowerCase();
+            if (name.equals(needle) || name.contains(needle)) {
+                total += item.getQuantity();
+            }
+        }
+        return total;
+    }
+
+    private int snapshotInventoryQuantityByName(PreExecutionSnapshot pre, String itemName) {
+        if (pre == null || itemName == null || itemName.isEmpty()) {
+            return 0;
+        }
+        String needle = itemName.toLowerCase();
+        int total = 0;
+        for (Map.Entry<String, Integer> entry : pre.inventoryNameQuantities.entrySet()) {
+            String key = entry.getKey();
+            if (key != null && (key.equals(needle) || key.contains(needle))) {
+                total += entry.getValue();
+            }
+        }
+        return total;
     }
 
     private boolean isMovementIntentSatisfied(ActionRecord record, PreExecutionSnapshot pre) {
@@ -973,6 +1663,10 @@ public final class ActionTracker {
     }
 
     private String buildEvidenceJson(ActionRecord record, PreExecutionSnapshot pre) {
+        return buildEvidenceJson(record, pre, null);
+    }
+
+    private String buildEvidenceJson(ActionRecord record, PreExecutionSnapshot pre, String executionResultJson) {
         JsonBuilder json = new JsonBuilder();
         json.startObject();
 
@@ -1041,15 +1735,121 @@ public final class ActionTracker {
             json.field("walkerDone", path.isDone());
             json.field("walkerCanceled", path.isCanceled());
             json.field("walkerSteps", path.getSteps() == null ? 0 : path.getSteps().size());
+            json.field("walkerActive", !path.isDone() && !path.isCanceled());
         } else {
             json.fieldNull("walkerDone");
             json.fieldNull("walkerCanceled");
             json.fieldNull("walkerSteps");
+            json.fieldNull("walkerActive");
+        }
+
+        if (isSmartInteractionAction(record)) {
+            json.key("smartInteraction").startObject();
+            if (record.smartPhase != null) {
+                json.field("phase", record.smartPhase);
+            } else {
+                json.fieldNull("phase");
+            }
+            json.field("walkRequired", record.smartWalkRequired);
+            json.field("interactionSubmitted", record.smartInteractionSubmitted);
+            if (record.smartApproachTileJson != null) {
+                json.fieldRaw("approachTile", record.smartApproachTileJson);
+            } else {
+                json.fieldNull("approachTile");
+            }
+
+            WorldPoint reference = getSmartReferencePoint(record);
+            if (reference != null) {
+                json.fieldRaw("referencePosition", JsonBuilder.position(reference.getX(), reference.getY(), reference.getPlane()));
+            } else {
+                json.fieldNull("referencePosition");
+            }
+            json.endObject();
+        }
+
+        if ("GE_BUY_AUTO".equals(record.type)) {
+            int requestItemId = extractJsonInt(record.requestPayloadJson, "itemId", -1);
+            int requestAmount = extractJsonInt(record.requestPayloadJson, "amount", -1);
+            int requestInitialStep = extractJsonInt(record.requestPayloadJson, "initialFivePercentSteps", 1);
+            int requestMaxRetries = extractJsonInt(record.requestPayloadJson, "maxRetries", 6);
+            int requestWaitTicks = extractJsonInt(record.requestPayloadJson, "waitTicksPerAttempt", 6);
+
+            int attemptsUsed = extractJsonInt(executionResultJson, "attemptsUsed", -1);
+            int finalStep = extractJsonInt(executionResultJson, "finalFivePercentSteps", -1);
+            int quantitySold = extractJsonInt(executionResultJson, "quantitySold", -1);
+            String finalOfferState = extractJsonString(executionResultJson, "finalOfferState");
+            int geSlot = extractJsonInt(executionResultJson, "slot", -1);
+
+            json.key("ge").startObject();
+            json.field("itemId", requestItemId);
+            json.field("amount", requestAmount);
+            json.field("initialFivePercentSteps", requestInitialStep);
+            json.field("maxRetries", requestMaxRetries);
+            json.field("waitTicksPerAttempt", requestWaitTicks);
+            if (attemptsUsed >= 0) {
+                json.field("attemptsUsed", attemptsUsed);
+            } else {
+                json.fieldNull("attemptsUsed");
+            }
+            if (finalStep >= 0) {
+                json.field("finalFivePercentSteps", finalStep);
+            } else {
+                json.fieldNull("finalFivePercentSteps");
+            }
+            if (quantitySold >= 0) {
+                json.field("quantitySold", quantitySold);
+            } else {
+                json.fieldNull("quantitySold");
+            }
+            if (geSlot > 0) {
+                json.field("slot", geSlot);
+            } else {
+                json.fieldNull("slot");
+            }
+            if (finalOfferState != null && !finalOfferState.isEmpty()) {
+                json.field("finalOfferState", finalOfferState);
+            } else {
+                json.fieldNull("finalOfferState");
+            }
+            json.endObject();
         }
 
         json.endObject();
         json.endObject();
         return json.toString();
+    }
+
+    private void maybeRecordGeResolution(ActionRecord record, String executionResultJson) {
+        if (record == null || !"GE_BUY_AUTO".equals(record.type) || !record.status.isTerminal()) {
+            return;
+        }
+
+        int itemId = extractJsonInt(executionResultJson, "itemId", extractJsonInt(record.requestPayloadJson, "itemId", -1));
+        int requestedAmount = extractJsonInt(executionResultJson, "amount", extractJsonInt(record.requestPayloadJson, "amount", -1));
+        int quantityBought = extractJsonInt(executionResultJson, "quantitySold", -1);
+        int attemptsUsed = extractJsonInt(executionResultJson, "attemptsUsed", -1);
+        int slot = extractJsonInt(executionResultJson, "slot", -1);
+        int finalFivePercentSteps = extractJsonInt(executionResultJson, "finalFivePercentSteps", -1);
+        String finalOfferState = extractJsonString(executionResultJson, "finalOfferState");
+
+        if (quantityBought < 0) {
+            quantityBought = record.status == ActionStatus.SUCCEEDED ? requestedAmount : 0;
+        }
+
+        RecentGeOfferStore.record(new RecentGeOfferStore.RecentGeOfferResolution(
+                record.actionId,
+                record.status.name(),
+                record.reasonCode,
+                record.reasonText,
+                record.updatedAtMs,
+                itemId,
+                requestedAmount,
+                quantityBought,
+                attemptsUsed,
+                slot,
+                finalFivePercentSteps,
+                finalOfferState
+        ));
     }
 
     private void cleanupOldEntries() {
@@ -1306,7 +2106,15 @@ public final class ActionTracker {
         return json.substring(valueStart, valueEnd);
     }
 
-    private ReasonCode mapReason(int code, String message) {
+    private ReasonCode mapReason(int code, String reasonToken, String message) {
+        if (reasonToken != null && !reasonToken.isEmpty()) {
+            try {
+                return ReasonCode.valueOf(reasonToken);
+            } catch (IllegalArgumentException ignored) {
+                // Fallback to message/code heuristics.
+            }
+        }
+
         String msg = message == null ? "" : message.toLowerCase();
 
         if (msg.contains("someone else is fighting that")
@@ -1338,6 +2146,27 @@ public final class ActionTracker {
         if (msg.contains("item not found in bank")) {
             return ReasonCode.INVALID_TARGET;
         }
+        if (msg.contains("shop is not open")) {
+            return ReasonCode.INTERFACE_BLOCKED;
+        }
+        if (msg.contains("item not found in current shop") || msg.contains("item not found in inventory")) {
+            return ReasonCode.INVALID_TARGET;
+        }
+        if (msg.contains("grand exchange is not open") || msg.contains("grand exchange closed")) {
+            return ReasonCode.GE_INTERFACE_CLOSED;
+        }
+        if (msg.contains("no free grand exchange slot") || msg.contains("failed to resolve grand exchange slot")) {
+            return ReasonCode.GE_SLOT_UNAVAILABLE;
+        }
+        if (msg.contains("failed to start grand exchange buy offer")) {
+            return ReasonCode.GE_OFFER_START_FAILED;
+        }
+        if (msg.contains("partially filled")) {
+            return ReasonCode.GE_OFFER_NOT_FILLED;
+        }
+        if (msg.contains("did not fill at attempted prices") || msg.contains("last price step")) {
+            return ReasonCode.GE_PRICE_TOO_LOW;
+        }
 
         if (code == 404) {
             return ReasonCode.INVALID_TARGET;
@@ -1361,6 +2190,9 @@ public final class ActionTracker {
                 || code == ReasonCode.PATH_BLOCKED
                 || code == ReasonCode.STILL_MOVING
                 || code == ReasonCode.INTERRUPTED
+                || code == ReasonCode.GE_PRICE_TOO_LOW
+                || code == ReasonCode.GE_OFFER_NOT_FILLED
+                || code == ReasonCode.GE_INTERFACE_CLOSED
                 || code == ReasonCode.UNKNOWN_ERROR;
     }
 

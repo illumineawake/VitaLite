@@ -97,7 +97,7 @@ public class MakeXAPI
     DialogueAPI.resumePause(InterfaceID.Skillmulti.A + index, getAmount());
   }
 
-  private static List<ItemEx> getResultingItems()
+  public static List<ItemEx> getResultingItems()
   {
     List<ItemEx> items = new ArrayList<>();
     for (int i = InterfaceID.Skillmulti.A; i < InterfaceID.Skillmulti.R; i++) //ok jagex...

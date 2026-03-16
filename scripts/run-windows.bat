@@ -12,7 +12,12 @@ if not exist "%JDK_DIR%\bin\java.exe" (
     echo JDK not found. Downloading JDK %JDK_VERSION%...
     
     :: Download using PowerShell
-    powershell -Command "$ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('https://api.adoptium.net/v3/binary/version/jdk-11.0.19+7/windows/x64/jdk/hotspot/normal/eclipse', '%JDK_DIR%\jdk-temp.zip')"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference = 'SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object Net.WebClient).DownloadFile('https://api.adoptium.net/v3/binary/version/jdk-11.0.19+7/windows/x64/jdk/hotspot/normal/eclipse', '%JDK_DIR%\jdk-temp.zip')"
+    if errorlevel 1 (
+        echo Download failed!
+        pause
+        exit /b 1
+    )
     
     if not exist "%JDK_DIR%\jdk-temp.zip" (
         echo Download failed!
@@ -22,7 +27,12 @@ if not exist "%JDK_DIR%\bin\java.exe" (
     
     :: Extract JDK using PowerShell
     echo Extracting JDK...
-    powershell -Command "Expand-Archive -Path '%JDK_DIR%\jdk-temp.zip' -DestinationPath '%JDK_DIR%\temp' -Force"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; if (Test-Path '%JDK_DIR%\temp') { Remove-Item -Recurse -Force '%JDK_DIR%\temp' }; [System.IO.Compression.ZipFile]::ExtractToDirectory('%JDK_DIR%\jdk-temp.zip', '%JDK_DIR%\temp')"
+    if errorlevel 1 (
+        echo Extraction failed!
+        pause
+        exit /b 1
+    )
     
     :: Move contents from the nested folder to JDK_DIR
     for /d %%i in ("%JDK_DIR%\temp\*") do (
@@ -38,6 +48,19 @@ if not exist "%JDK_DIR%\bin\java.exe" (
 ) else (
     echo JDK found at %JDK_DIR%
 )
+
+if not exist "%JDK_DIR%\bin\java.exe" (
+    echo java.exe not found after JDK setup.
+    pause
+    exit /b 1
+)
+
+if not exist "%JAR_NAME%" (
+    echo Missing %JAR_NAME% in current directory.
+    pause
+    exit /b 1
+)
+
 :: Launch the application
 echo Launching application...
 "%JDK_DIR%\bin\java.exe" -jar "%JAR_NAME%" %*
